@@ -1,281 +1,364 @@
 <?php
 /**
- * Plugin Name: CF7 → Bloomreach (Async, Consent-Safe)
+ * Plugin Name: Bloomreach Contact Forms (CF7 → BR, Async + Consent-Safe)
  * Description: Sends CF7 submissions to Bloomreach asynchronously. Pushes consent only if the customer doesn't already have it.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Steve O'Rourke
+ * License: GPLv2 or later
  */
 
 if (!defined('ABSPATH')) exit;
 
-
-/**
- * (Optional) Ensure Markdown parser exists for PUC GitHub release notes.
- * Safe to keep; harmless if vendor already loads it.
- */
-if ( ! class_exists('Parsedown') ) {
-    foreach ([
-        __DIR__ . '/inc/plugin-update-checker/vendor/Parsedown.php',
-        __DIR__ . '/inc/plugin-update-checker/vendor/ParsedownModern.php',
-        __DIR__ . '/inc/plugin-update-checker/vendor/erusev/parsedown/Parsedown.php',
-    ] as $pd) {
-        if ( is_readable($pd) ) { require_once $pd; break; }
-    }
-}
-
-/**
- * Plugin Update Checker bootstrap (robust for v5+)
- */
-$__puc_loader = __DIR__ . '/inc/plugin-update-checker/plugin-update-checker.php';
-
-if ( file_exists($__puc_loader) ) {
-    require_once $__puc_loader;
-
-    // Try latest namespaces first, then fallback
-    $factoryClass = null;
-    foreach ([
-        '\YahnisElsts\PluginUpdateChecker\v5p7\PucFactory',
-        '\YahnisElsts\PluginUpdateChecker\v5p6\PucFactory',
-        '\YahnisElsts\PluginUpdateChecker\v5\PucFactory',
-        'Puc_v5_Factory',
-    ] as $candidate) {
-        if ( class_exists($candidate) ) { $factoryClass = $candidate; break; }
-    }
-
-    if ( $factoryClass ) {
-        $updateChecker = $factoryClass::buildUpdateChecker(
-            'https://github.com/infoitteam/bloomreach-contact-forms',
-            __FILE__,
-            'bloomreach-contact-forms' // plugin folder slug
-        );
-        $updateChecker->setBranch('main'); // track main branch
-    }
-}
-
-
-} else {
-    add_action('admin_notices', function () {
-        echo '<div class="notice notice-error"><p><strong>CF7 → Bloomreach:</strong> Missing <code>inc/plugin-update-checker/plugin-update-checker.php</code>. Reinstall the plugin.</p></div>';
-    });
-    error_log('CF7→BR: plugin-update-checker.php missing at ' . $__puc_loader);
-}
-
-
-
-class CF7_Bloomreach_Async {
-    const OPT = 'cf7_br_settings';
-    const CRON_HOOK = 'cf7_br_send_job';
-    const TRANSIENT_PREFIX = 'cf7_br_consent_'; // email|consent_key → bool
+class BR_CF7_Async {
+    const OPT = 'br_cf7_settings';
+    const CRON_HOOK = 'br_cf7_send_job';
+    const TRANSIENT_PREFIX = 'br_cf7_consent_'; // md5(email|consent_key) => '1'/'0'
 
     public function __construct() {
-        // Admin settings
+        // Admin
         add_action('admin_init', [$this, 'register_settings']);
-        add_action('admin_menu', function() {
-            add_options_page('CF7 → Bloomreach', 'CF7 → Bloomreach', 'manage_options', 'cf7-br', [$this, 'settings_page']);
+        add_action('admin_menu', function () {
+            add_options_page('Bloomreach Contact Forms', 'Bloomreach → CF7', 'manage_options', 'br-cf7', [$this, 'settings_page']);
         });
 
-        // Hook CF7 submit
+        // CF7 hook
         add_action('wpcf7_mail_sent', [$this, 'on_cf7_submit'], 10, 1);
 
-        // Cron consumer
+        // Cron worker
         add_action(self::CRON_HOOK, [$this, 'process_job'], 10, 1);
     }
 
-    /** SETTINGS **/
-    public function register_settings() {
-        register_setting(self::OPT, self::OPT, function($in) {
-            $out = [
-                'token'       => sanitize_text_field($in['token'] ?? ''),
-                'project'     => sanitize_text_field($in['project'] ?? ''), // optional
-                'api_base'    => esc_url_raw($in['api_base'] ?? 'https://api.exponea.com'), // adjust if needed
-                'forms'       => is_array($in['forms'] ?? []) ? array_map(function($row){
-                    return [
-                        'form_id'     => absint($row['form_id'] ?? 0),
-                        'event_type'  => sanitize_key($row['event_type'] ?? 'cf7_submit'),
-                        'consent_key' => sanitize_key($row['consent_key'] ?? ''), // e.g. marketing_email
-                        'email_field' => sanitize_key($row['email_field'] ?? 'your-email'),
-                        // optional extra fields map (cf7_name_field => br_property_key)
-                        'map'         => array_filter(array_map('sanitize_text_field', $row['map'] ?? [])),
-                    ];
-                }, $in['forms']) : [],
-                'consent_cache_minutes' => max(1, absint($in['consent_cache_minutes'] ?? 60)),
-                'timeout'     => max(3, absint($in['timeout'] ?? 5)),
+    /* =======================
+     * SETTINGS
+     * ======================= */
+
+public function register_settings() {
+register_setting(self::OPT, self::OPT, function($in) {
+    $projectToken = sanitize_text_field($in['project'] ?? '');
+    $out = [
+        'token'   => sanitize_text_field($in['token'] ?? $projectToken),
+        'project' => $projectToken,
+        'api_base'=> esc_url_raw($in['api_base'] ?? 'https://api.uk.exponea.com'),
+        'timeout' => max(3, absint($in['timeout'] ?? 8)),
+        'consent_cache_minutes' => max(1, absint($in['consent_cache_minutes'] ?? 60)),
+        'forms'   => [],
+    ];
+
+    $badPairs = [];
+    $haveAnyNotice = false;
+
+    if (is_array($in['forms'] ?? null)) {
+        foreach ($in['forms'] as $row) {
+            // Normalize fields
+            $form_id     = absint($row['form_id'] ?? 0);
+            $event_type  = sanitize_key($row['event_type'] ?? 'cf7_submit');
+            $consent_key = sanitize_key($row['consent_key'] ?? '');
+            $email_field = sanitize_key($row['email_field'] ?? 'your-email');
+            $map_str     = '';
+
+            if (!empty($row['map_str'])) {
+                $map_str = (string)$row['map_str'];
+            } elseif (!empty($row['map']) && is_array($row['map'])) {
+                $pairs = [];
+                foreach ($row['map'] as $k => $v) { $pairs[] = "{$k}={$v}"; }
+                $map_str = implode(',', $pairs);
+            }
+
+            // Skip truly empty rows (prevents duplicate warnings)
+            $isRowEmpty = ($form_id === 0) && ($event_type === 'cf7_submit') && ($consent_key === '') && ($email_field === 'your-email') && (trim($map_str) === '');
+            if ($isRowEmpty) {
+                continue;
+            }
+
+            // Parse map_str (comma or newline separated)
+            $map = [];
+            $pieces = preg_split('/[,\r\n]+/', (string)$map_str);
+            foreach ($pieces as $piece) {
+                $piece = trim($piece);
+                if ($piece === '') continue;
+                if (strpos($piece, '=') === false) {
+                    $badPairs[] = $piece; // e.g., "12121"
+                    continue;
+                }
+                list($cf7,$br) = array_map('trim', explode('=', $piece, 2));
+                if ($cf7 === '' || $br === '') { $badPairs[] = $piece; continue; }
+                $map[sanitize_key($cf7)] = sanitize_text_field($br);
+            }
+
+            $out['forms'][] = [
+                'form_id'     => $form_id,
+                'event_type'  => $event_type,
+                'consent_key' => $consent_key,
+                'email_field' => $email_field,
+                'map'         => $map,
             ];
-            return $out;
-        });
+        }
     }
 
-    public function settings_page() {
-        $s = get_option(self::OPT, []);
-        ?>
-        <div class="wrap">
-            <h1>CF7 → Bloomreach</h1>
-            <form method="post" action="options.php">
-                <?php settings_fields(self::OPT); ?>
-                <table class="form-table">
-                    <tr><th>Bloomreach Token</th>
-                        <td><input type="text" name="<?php echo self::OPT; ?>[token]" value="<?php echo esc_attr($s['token'] ?? ''); ?>" size="60" /></td></tr>
-                    <tr><th>Project (optional)</th>
-                        <td><input type="text" name="<?php echo self::OPT; ?>[project]" value="<?php echo esc_attr($s['project'] ?? ''); ?>" size="60" /></td></tr>
-                    <tr><th>API Base</th>
-                        <td><input type="text" name="<?php echo self::OPT; ?>[api_base]" value="<?php echo esc_attr($s['api_base'] ?? 'https://api.exponea.com'); ?>" size="60" /></td></tr>
-                    <tr><th>HTTP Timeout (s)</th>
-                        <td><input type="number" name="<?php echo self::OPT; ?>[timeout]" value="<?php echo esc_attr($s['timeout'] ?? 5); ?>" min="3" max="20"/></td></tr>
-                    <tr><th>Consent cache (minutes)</th>
-                        <td><input type="number" name="<?php echo self::OPT; ?>[consent_cache_minutes]" value="<?php echo esc_attr($s['consent_cache_minutes'] ?? 60); ?>" min="1" max="1440"/></td></tr>
-                </table>
+    // ONE notice max, even if multiple rows had bad tokens
+    if (!empty($badPairs)) {
+        static $didWarn = false;
+        if (!$didWarn) {
+            add_settings_error(
+                self::OPT,
+                'br_cf7_map_warn',
+                sprintf(
+                    'Saved, but ignored %d malformed mapping pair(s): %s. Use the format %s (one per line or comma-separated).',
+                    count($badPairs),
+                    esc_html(implode(', ', array_unique($badPairs))),
+                    '<code>cf7_field=br_property</code>'
+                ),
+                'warning'
+            );
+            $didWarn = true;
+        }
+    }
 
-                <h2>Form mappings</h2>
-                <p>Map CF7 forms to Bloomreach event/consent. Add one row per form.</p>
-                <table class="widefat striped">
-                    <thead><tr>
-                        <th>CF7 Form ID</th>
-                        <th>Event Type</th>
-                        <th>Consent Key (optional)</th>
-                        <th>Email Field (CF7 name)</th>
-                        <th>Extra field map (cf7_field=br_property)</th>
-                    </tr></thead>
-                    <tbody>
-                    <?php
-                    $rows = $s['forms'] ?? [];
-                    if (empty($rows)) $rows = [['form_id'=>'','event_type'=>'cf7_submit','consent_key'=>'','email_field'=>'your-email','map'=>[]]];
-                    foreach ($rows as $i => $row) {
-                        echo '<tr>';
-                        printf('<td><input name="%s[forms][%d][form_id]" type="number" value="%s" min="1" /></td>', self::OPT, $i, esc_attr($row['form_id'] ?? ''));
-                        printf('<td><input name="%s[forms][%d][event_type]" value="%s" /></td>', self::OPT, $i, esc_attr($row['event_type'] ?? 'cf7_submit'));
-                        printf('<td><input name="%s[forms][%d][consent_key]" value="%s" placeholder="e.g. marketing_email"/></td>', self::OPT, $i, esc_attr($row['consent_key'] ?? ''));
-                        printf('<td><input name="%s[forms][%d][email_field]" value="%s" placeholder="your-email"/></td>', self::OPT, $i, esc_attr($row['email_field'] ?? 'your-email'));
-                        // Simple key=value pairs separated by commas
-                        $map_str = '';
-                        if (!empty($row['map']) && is_array($row['map'])) {
-                            $pairs = [];
-                            foreach ($row['map'] as $k => $v) $pairs[] = "{$k}={$v}";
-                            $map_str = implode(',', $pairs);
-                        }
-                        printf('<td><input name="%s[forms][%d][map_str]" value="%s" placeholder="first-name=first_name,last-name=last_name"/></td>', self::OPT, $i, esc_attr($map_str));
-                        echo '</tr>';
+    return $out;
+});
+}
+
+
+public function settings_page() {
+    $s = get_option(self::OPT, []);
+    $rows = $s['forms'] ?? [];
+    if (empty($rows)) {
+        $rows = [[
+            'form_id'     => '',
+            'event_type'  => 'cf7_submit',
+            'consent_key' => '',
+            'email_field' => 'your-email',
+            'map'         => [],
+        ]];
+    }
+    ?>
+    <div class="wrap">
+        <h1>Bloomreach Contact Forms (CF7 → BR)</h1>
+
+        <?php settings_errors(self::OPT); /* show our notices if any */ ?>
+
+        <form method="post" action="options.php" id="brcf7-admin-form">
+            <?php settings_fields(self::OPT); ?>
+
+            <table class="form-table">
+                <tr>
+                    <th scope="row">API Base</th>
+                    <td>
+                        <input type="url" name="<?php echo self::OPT; ?>[api_base]"
+                               value="<?php echo esc_attr($s['api_base'] ?? 'https://api.uk.exponea.com'); ?>" size="50">
+                        <p class="description">Your shard, e.g. https://api.uk.exponea.com</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">Project token (UUID)</th>
+                    <td>
+                        <input type="text" name="<?php echo self::OPT; ?>[project]"
+                               value="<?php echo esc_attr($s['project'] ?? ''); ?>" size="50" required>
+                        <p class="description">The Project token from Bloomreach. Required and also used in the URL path.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">Token (Authorization)</th>
+                    <td>
+                        <input type="text" name="<?php echo self::OPT; ?>[token]"
+                               value="<?php echo esc_attr($s['token'] ?? ''); ?>" size="50">
+                        <p class="description">Defaults to the same as Project token. Used as <code>Authorization: Token &lt;token&gt;</code>.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">HTTP timeout (s)</th>
+                    <td><input type="number" min="3" max="20" name="<?php echo self::OPT; ?>[timeout]" value="<?php echo esc_attr($s['timeout'] ?? 8); ?>"></td>
+                </tr>
+                <tr>
+                    <th scope="row">Consent cache (minutes)</th>
+                    <td><input type="number" min="1" max="1440" name="<?php echo self::OPT; ?>[consent_cache_minutes]" value="<?php echo esc_attr($s['consent_cache_minutes'] ?? 60); ?>"></td>
+                </tr>
+            </table>
+
+            <h2>Form mappings</h2>
+            <p>Use <code>cf7_field=br_property</code> pairs, separated by <em>commas or new lines</em>.</p>
+
+            <table class="widefat striped" id="brcf7-matrix">
+                <thead>
+                    <tr>
+                        <th style="width:110px;">CF7 Form ID</th>
+                        <th style="width:160px;">Event Type</th>
+                        <th style="width:220px;">Consent Key (optional)</th>
+                        <th style="width:180px;">Email Field</th>
+                        <th>Extra field map (cf7_field=br_property, ...)</th>
+                        <th style="width:80px;"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($rows as $i => $row):
+                    $map_str = '';
+                    if (!empty($row['map']) && is_array($row['map'])) {
+                        $pairs = [];
+                        foreach ($row['map'] as $k => $v) { $pairs[] = "{$k}={$v}"; }
+                        $map_str = implode(',', $pairs);
                     }
                     ?>
-                    </tbody>
-                </table>
-                <p><em>Tip:</em> For more rows, just add and save; the plugin preserves them.</p>
-                <?php submit_button(); ?>
-            </form>
-        </div>
-        <?php
-    }
+                    <tr>
+                        <td><input type="number" min="1" step="1" class="brcf7-id" name="<?php echo self::OPT; ?>[forms][<?php echo $i; ?>][form_id]" value="<?php echo esc_attr($row['form_id']); ?>"></td>
+                        <td><input type="text" class="brcf7-event" name="<?php echo self::OPT; ?>[forms][<?php echo $i; ?>][event_type]" value="<?php echo esc_attr($row['event_type']); ?>"></td>
+                        <td><input type="text" class="brcf7-consent" name="<?php echo self::OPT; ?>[forms][<?php echo $i; ?>][consent_key]" value="<?php echo esc_attr($row['consent_key']); ?>" placeholder="e.g. marketing_email"></td>
+                        <td><input type="text" class="brcf7-email" name="<?php echo self::OPT; ?>[forms][<?php echo $i; ?>][email_field]" value="<?php echo esc_attr($row['email_field']); ?>" placeholder="your-email"></td>
+                        <td>
+                            <textarea class="brcf7-extra" name="<?php echo self::OPT; ?>[forms][<?php echo $i; ?>][map_str]" rows="2" placeholder="first-name=first_name&#10;last-name=last_name&#10;phone=phone"><?php echo esc_textarea($map_str); ?></textarea>
+                        </td>
+                        <td><button type="button" class="button brcf7-remove">Remove</button></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+                <tfoot>
+                    <tr><td colspan="6"><button type="button" class="button button-secondary" id="brcf7-add">+ Add row</button></td></tr>
+                </tfoot>
+            </table>
 
-    /** CF7 submit hook */
+            <?php submit_button(); ?>
+        </form>
+
+        <style>
+            #brcf7-matrix input.brcf7-id      { width: 90px; }
+            #brcf7-matrix input.brcf7-event   { width: 150px; }
+            #brcf7-matrix input.brcf7-consent { width: 210px; }
+            #brcf7-matrix input.brcf7-email   { width: 170px; }
+            #brcf7-matrix textarea.brcf7-extra{ width:100%; max-width:none; min-height:44px; resize:vertical; }
+            #brcf7-matrix td { vertical-align: middle; }
+        </style>
+
+        <script>
+        (function(){
+            const tbody    = document.querySelector('#brcf7-matrix tbody');
+            const addBtn   = document.getElementById('brcf7-add');
+            let nextIndex  = tbody.querySelectorAll('tr').length;
+
+            addBtn.addEventListener('click', function(){
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td><input type="number" min="1" step="1" class="brcf7-id" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][form_id]" value=""></td>
+                    <td><input type="text" class="brcf7-event" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][event_type]" value="cf7_submit"></td>
+                    <td><input type="text" class="brcf7-consent" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][consent_key]" value="" placeholder="e.g. marketing_email"></td>
+                    <td><input type="text" class="brcf7-email" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][email_field]" value="your-email"></td>
+                    <td><textarea class="brcf7-extra" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][map_str]" rows="2" placeholder="first-name=first_name&#10;last-name=last_name&#10;phone=phone"></textarea></td>
+                    <td><button type="button" class="button brcf7-remove">Remove</button></td>
+                `;
+                tbody.appendChild(tr);
+                nextIndex++;
+            });
+
+            tbody.addEventListener('click', function(e){
+                if (e.target && e.target.classList.contains('brcf7-remove')) {
+                    const rows = tbody.querySelectorAll('tr');
+                    if (rows.length > 1) {
+                        e.target.closest('tr').remove();
+                    } else {
+                        e.target.closest('tr').querySelectorAll('input,textarea').forEach(el => el.value = '');
+                    }
+                }
+            });
+        })();
+        </script>
+    </div>
+    <?php
+}
+    /* =======================
+     * CF7 SUBMIT HOOK
+     * ======================= */
     public function on_cf7_submit($contact_form) {
         $s = get_option(self::OPT, []);
-        if (empty($s['token'])) return;
+        if (empty($s['project']) || empty($s['token'])) return;
 
         $form_id = absint($contact_form->id());
         $map = $this->find_form_map($s, $form_id);
         if (!$map) return;
 
-        // Extract submission data
         $submission = \WPCF7_Submission::get_instance();
         if (!$submission) return;
         $posted = $submission->get_posted_data();
 
         $email_field = $map['email_field'] ?: 'your-email';
-        $email = isset($posted[$email_field]) ? sanitize_email(is_array($posted[$email_field]) ? reset($posted[$email_field]) : $posted[$email_field]) : '';
+        $emailVal = $posted[$email_field] ?? '';
+        if (is_array($emailVal)) $emailVal = reset($emailVal);
+        $email = sanitize_email($emailVal);
         if (!$email) return;
 
-        // Build event properties
+        // Properties
         $props = [
-            'form_id'     => $form_id,
-            'form_title'  => $contact_form->name(),
-            'source_url'  => esc_url_raw($submission->get_meta('url')),
-            'user_agent'  => sanitize_text_field($_SERVER['HTTP_USER_AGENT'] ?? ''),
-            'ip'          => sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? ''),
+            'form_id'    => $form_id,
+            'form_title' => $contact_form->name(),
+            'source_url' => esc_url_raw($submission->get_meta('url')),
+            'user_agent' => sanitize_text_field($_SERVER['HTTP_USER_AGENT'] ?? ''),
+            'ip'         => sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? ''),
+            'site'       => home_url(),
         ];
-
-        // Extra field mappings (cf7_name -> br_property)
-        $extra_map = $this->parse_map_str($map);
-        foreach ($extra_map as $cf7_name => $br_key) {
+        foreach ($map['map'] as $cf7_name => $br_key) {
             if (isset($posted[$cf7_name])) {
-                $val = is_array($posted[$cf7_name]) ? implode(', ', array_map('sanitize_text_field', $posted[$cf7_name])) : sanitize_text_field($posted[$cf7_name]);
-                $props[$br_key] = $val;
+                $val = $posted[$cf7_name];
+                if (is_array($val)) $val = implode(', ', array_map('sanitize_text_field', $val));
+                $props[$br_key] = sanitize_text_field($val);
             }
         }
 
         $job = [
-            'type'         => 'submit',
-            'event_type'   => $map['event_type'] ?: 'cf7_submit',
-            'email'        => $email,
-            'properties'   => $props,
-            'consent_key'  => $map['consent_key'] ?: '',
-            'ts'           => time(),
-            'request_id'   => wp_generate_uuid4(), // idempotency-ish
+            'email'       => $email,
+            'event_type'  => $map['event_type'] ?: 'cf7_submit',
+            'properties'  => $props,
+            'consent_key' => $map['consent_key'] ?: '',
+            'ts'          => time(),
+            'request_id'  => wp_generate_uuid4(),
         ];
 
-        // Enqueue job via WP-Cron in ~30s (keeps submit fast)
+        // Enqueue (30s)
         wp_schedule_single_event(time() + 30, self::CRON_HOOK, [$job]);
     }
 
     private function find_form_map($s, $form_id) {
-        $rows = $s['forms'] ?? [];
-        foreach ($rows as $row) {
-            if (absint($row['form_id'] ?? 0) === $form_id) {
-                // Rebuild map from map_str if present
-                if (!empty($row['map_str'])) {
-                    $row['map'] = $this->kv_to_array($row['map_str']);
-                }
-                return $row;
-            }
+        foreach ($s['forms'] as $row) {
+            if (absint($row['form_id'] ?? 0) === $form_id) return $row;
         }
         return null;
     }
 
-    private function kv_to_array($str) {
-        $out = [];
-        foreach (explode(',', (string)$str) as $pair) {
-            $pair = trim($pair);
-            if (!$pair) continue;
-            $bits = explode('=', $pair, 2);
-            if (count($bits) === 2) $out[trim($bits[0])] = trim($bits[1]);
-        }
-        return $out;
-    }
-
-    private function parse_map_str($map_row) {
-        if (!empty($map_row['map']) && is_array($map_row['map'])) return $map_row['map'];
-        if (!empty($map_row['map_str'])) return $this->kv_to_array($map_row['map_str']);
-        return [];
-    }
-
-    /** Cron consumer */
+    /* =======================
+     * CRON WORKER
+     * ======================= */
     public function process_job($job) {
         $s = get_option(self::OPT, []);
-        $token    = $s['token'] ?? '';
-        $api_base = rtrim($s['api_base'] ?? 'https://api.exponea.com', '/');
-        $project  = $s['project'] ?? '';
-        $timeout  = max(3, absint($s['timeout'] ?? 5));
+        $token    = trim($s['token'] ?? '');
+        $project  = trim($s['project'] ?? '');
+        $api_base = rtrim($s['api_base'] ?? 'https://api.uk.exponea.com', '/');
+        $timeout  = max(3, absint($s['timeout'] ?? 8));
 
-        if (!$token) return;
+        if (!$token || !$project) return;
 
-        $email  = $job['email'];
-        $cids   = ['email' => $email];
-        if ($project) $cids['registered'] = $project . ':' . $email; // optional extra ID scheme
+        // Build endpoints (project token MUST be in the path)
+        $eventsUrl        = "{$api_base}/track/v2/projects/{$project}/events";
+        $customersGetUrl  = "{$api_base}/data/v2/projects/{$project}/customers";
+        $customerAttrsUrl = "{$api_base}/track/v2/projects/{$project}/customers/attributes"; // reserved if you switch to attribute writes
 
-        // 1) Push the main form submit event
+        $email = $job['email'];
+
+        // 1) Send main event
         $payload = [
-            'customer_ids' => $cids,
+            'customer_ids' => ['email' => $email],
             'event_type'   => $job['event_type'],
             'properties'   => $job['properties'],
             'timestamp'    => (int)$job['ts'],
         ];
-        $this->br_post("{$api_base}/track/v2/projects/events", $token, $payload, $timeout);
+        $this->br_post($eventsUrl, $token, $payload, $timeout);
 
-        // 2) Conditionally push consent (only if missing)
+        // 2) Conditionally push consent
         $consent_key = $job['consent_key'] ?? '';
         if ($consent_key) {
-            if (!$this->has_consent_cached_or_remote($api_base, $token, $email, $consent_key, (int)($s['consent_cache_minutes'] ?? 60), $timeout)) {
-                // push consent_granted event (adjust to your BR consent model)
+            $has = $this->has_consent_cached_or_remote(
+                $customersGetUrl, $token, $email, $consent_key,
+                (int)($s['consent_cache_minutes'] ?? 60),
+                $timeout
+            );
+            if (!$has) {
                 $consent_payload = [
-                    'customer_ids' => $cids,
+                    'customer_ids' => ['email' => $email],
                     'event_type'   => 'consent_granted',
                     'properties'   => [
                         'consent_key' => $consent_key,
@@ -284,49 +367,44 @@ class CF7_Bloomreach_Async {
                     ],
                     'timestamp'    => time(),
                 ];
-                $this->br_post("{$api_base}/track/v2/projects/events", $token, $consent_payload, $timeout);
-
-                // Mark cache as true
+                $this->br_post($eventsUrl, $token, $consent_payload, $timeout);
                 $this->set_consent_cache($email, $consent_key, true, (int)($s['consent_cache_minutes'] ?? 60));
             }
         }
     }
 
-    /** Consent cache + check **/
+    /* =======================
+     * CONSENT CACHE + LOOKUP
+     * ======================= */
     private function cache_key($email, $consent_key) {
         return self::TRANSIENT_PREFIX . md5(strtolower($email) . '|' . $consent_key);
     }
-
     private function set_consent_cache($email, $consent_key, $val, $minutes) {
         set_transient($this->cache_key($email, $consent_key), $val ? '1' : '0', $minutes * MINUTE_IN_SECONDS);
     }
-
     private function get_consent_cache($email, $consent_key) {
         $v = get_transient($this->cache_key($email, $consent_key));
         if ($v === false) return null;
         return $v === '1';
     }
 
-    private function has_consent_cached_or_remote($api_base, $token, $email, $consent_key, $cache_minutes, $timeout) {
+    private function has_consent_cached_or_remote($customersGetUrl, $token, $email, $consent_key, $cache_minutes, $timeout) {
         $cached = $this->get_consent_cache($email, $consent_key);
         if ($cached !== null) return (bool)$cached;
 
-        // Ask Bloomreach: get customer profile incl. consents
-        // Adjust URL/fields to your BR project; this example assumes a v2 customers endpoint that returns consents
-        $url = $api_base . '/track/v2/projects/customers/get';
-        $payload = [
+        // Read customer incl. consents (Data v2)
+        $res = $this->br_post($customersGetUrl, $token, [
             'customer_ids' => ['email' => $email],
             'options'      => ['include' => ['consents']],
-        ];
-        $res = $this->br_post($url, $token, $payload, $timeout);
-        $has = false;
+        ], $timeout);
 
-        if (is_array($res) && !empty($res['data']['consents']) && is_array($res['data']['consents'])) {
-            // Expect structure like: consents: { marketing_email: {status: "opt_in"/"opt_out"} }
-            $c = $res['data']['consents'][$consent_key] ?? null;
-            if (is_array($c)) {
-                $status = strtolower($c['status'] ?? '');
-                $has = ($status === 'opt_in' || $status === 'granted' || $status === 'true' || $status === '1');
+        $has = false;
+        if (is_array($res)) {
+            // Expected shape: { success: true, data: { consents: { key: {status: "..."} } } }
+            $consents = $res['data']['consents'] ?? null;
+            if (is_array($consents) && isset($consents[$consent_key])) {
+                $status = strtolower($consents[$consent_key]['status'] ?? '');
+                $has = in_array($status, ['opt_in', 'granted', 'true', '1'], true);
             }
         }
 
@@ -334,8 +412,10 @@ class CF7_Bloomreach_Async {
         return $has;
     }
 
-    /** HTTP helper */
-    private function br_post($url, $token, $body, $timeout = 5) {
+    /* =======================
+     * HTTP helper
+     * ======================= */
+    private function br_post($url, $token, $body, $timeout = 8) {
         $args = [
             'timeout' => $timeout,
             'headers' => [
@@ -345,16 +425,42 @@ class CF7_Bloomreach_Async {
             'body'    => wp_json_encode($body),
         ];
         $r = wp_remote_post($url, $args);
-        if (is_wp_error($r)) return null;
+        if (is_wp_error($r)) {
+            error_log('[CF7→BR] WP_Error: ' . $r->get_error_message());
+            return null;
+        }
+        $code = (int)wp_remote_retrieve_response_code($r);
+        $body = wp_remote_retrieve_body($r);
+        $out  = json_decode($body, true);
 
-        $code = (int) wp_remote_retrieve_response_code($r);
-        $out  = json_decode(wp_remote_retrieve_body($r), true);
-        // Optional: log non-2xx
         if ($code < 200 || $code >= 300) {
-            error_log('[CF7→BR] Non-2xx: ' . $code . ' ' . $url . ' ' . substr(wp_remote_retrieve_body($r),0,500));
+            error_log('[CF7→BR] Non-2xx: ' . $code . ' ' . $url . ' ' . substr($body, 0, 500));
         }
         return $out;
     }
 }
 
-new CF7_Bloomreach_Async();
+new BR_CF7_Async();
+
+/* =======================
+ * (Optional) PUC bootstrap
+ * ======================= */
+$__puc_loader = __DIR__ . '/inc/plugin-update-checker/plugin-update-checker.php';
+if ( file_exists($__puc_loader) ) {
+    require_once $__puc_loader;
+    foreach ([
+        '\YahnisElsts\PluginUpdateChecker\v5p7\PucFactory',
+        '\YahnisElsts\PluginUpdateChecker\v5p6\PucFactory',
+        '\YahnisElsts\PluginUpdateChecker\v5\PucFactory',
+        'Puc_v5_Factory',
+    ] as $candidate) {
+        if ( class_exists($candidate) ) {
+            $candidate::buildUpdateChecker(
+                'https://github.com/infoitteam/bloomreach-contact-forms',
+                __FILE__,
+                'bloomreach-contact-forms'
+            )->setBranch('main');
+            break;
+        }
+    }
+}
