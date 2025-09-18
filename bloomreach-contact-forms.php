@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Bloomreach Contact Forms (CF7 → BR, Async + Consent-Safe)
- * Description: Sends CF7 submissions to Bloomreach asynchronously. Pushes consent only if the customer doesn't already have it.
- * Version: 1.0.2
+ * Description: Sends CF7 submissions to Bloomreach. Pushes consent only if the customer doesn't already have it.
+ * Version: 1.0.4
  * Author: Steve O'Rourke
  * License: GPLv2 or later
  */
@@ -67,7 +67,7 @@ private function extract_phone_from_post(array $posted, array $map_row) {
     if (strpos($v,':')!==false) return 'Basic '.base64_encode($v);
         // Otherwise treat as a Public API token
         return 'Token '.$v;
-    }   
+    }
 
     private function auth_mode($v){
         if (stripos($v,'Basic ')===0 || strpos($v,':')!==false) return 'basic';
@@ -174,7 +174,7 @@ register_setting(self::OPT, self::OPT, function($in) {
         foreach ($in['forms'] as $row) {
             // Normalize fields
             $form_id     = absint($row['form_id'] ?? 0);
-            $event_type  = sanitize_key($row['event_type'] ?? 'cf7_submit');
+            $event_type  = sanitize_key($row['event_type'] ?? 'contact_forms');
             $consent_key = sanitize_key($row['consent_key'] ?? '');
             $email_field = sanitize_key($row['email_field'] ?? 'your-email');
             $map_str     = '';
@@ -248,7 +248,7 @@ public function settings_page() {
     if (empty($rows)) {
         $rows = [[
             'form_id'     => '',
-            'event_type'  => 'cf7_submit',
+            'event_type'  => 'contact_forms',
             'consent_key' => '',
             'email_field' => 'your-email',
             'map'         => [],
@@ -286,7 +286,7 @@ public function settings_page() {
                         <input type="text" name="<?php echo self::OPT; ?>[token]"
                                value="<?php echo esc_attr($s['token'] ?? ''); ?>" size="50">
                         <p class="description">
-                                Public: paste API token (sends <code>Authorization: Token …</code>). 
+                                Public: paste API token (sends <code>Authorization: Token …</code>).
                                 Private: paste <code>KEYID:SECRET</code> (sends <code>Authorization: Basic …</code>).
                         </p>
                     </td>
@@ -363,7 +363,7 @@ public function settings_page() {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td><input type="number" min="1" step="1" class="brcf7-id" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][form_id]" value=""></td>
-                    <td><input type="text" class="brcf7-event" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][event_type]" value="cf7_submit"></td>
+                    <td><input type="text" class="brcf7-event" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][event_type]" value="contact_forms"></td>
                     <td><input type="text" class="brcf7-consent" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][consent_key]" value="" placeholder="e.g. marketing_email"></td>
                     <td><input type="text" class="brcf7-email" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][email_field]" value="your-email"></td>
                     <td><textarea class="brcf7-extra" name="<?php echo esc_js(self::OPT); ?>[forms][${nextIndex}][map_str]" rows="2" placeholder="first-name=first_name&#10;last-name=last_name&#10;phone=phone"></textarea></td>
@@ -440,7 +440,8 @@ public function on_cf7_submit($contact_form) {
     // Event properties (baseline + mapped)
     $props = [
         'form_id'    => $form_id,
-        'form_title' => $contact_form->name(),
+        'form_title' => method_exists($contact_form,'title') ? $contact_form->title() : $contact_form->name(),
+        'form_slug'  => $contact_form->name(), // (optional) keep the slug too
         'source_url' => esc_url_raw($submission->get_meta('url')),
         'user_agent' => sanitize_text_field($_SERVER['HTTP_USER_AGENT'] ?? ''),
         'ip'         => sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? ''),
@@ -466,7 +467,7 @@ public function on_cf7_submit($contact_form) {
     $job = [
         'ids'         => $ids,                // <-- used for profile update
         'email'       => $email,              // still used for main event
-        'event_type'  => $map['event_type'] ?: 'cf7_submit',
+        'event_type'  => $map['event_type'] ?: 'contact_forms',
         'properties'  => $props,
         'customer_props' => $customerProps,   // <-- properties to write to profile
         'consent_key' => $map['consent_key'] ?: '',
